@@ -1,0 +1,207 @@
+name: build-and-publish-binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hib-public-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: 26.10.0
+  RELEASE_REPOSITORY: ${{ github.repository }}
+  RELEASE_TAG: ${{ github.ref_name }}
+  SOURCE_REF: ${{ github.ref }}
+  HIB_NO_UPDATE_CHECK: '1'
+
+jobs:
+  verify:
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: gyteng/hib-cli
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          persist-credentials: false
+          ref: ${{ env.SOURCE_REF }}
+      - name: Pin source commit
+        id: source
+        shell: bash
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install dependencies
+        shell: bash
+        run: |
+          npm ci > "$RUNNER_TEMP/hib-install.log" 2>&1 || { echo 'Dependency installation failed; reproduce against the selected private source ref.'; exit 1; }
+      - name: Validate release version
+        shell: bash
+        run: node ci/assert-release-version.mjs "$RELEASE_TAG"
+      - name: Test private source
+        shell: bash
+        run: |
+          npm test > "$RUNNER_TEMP/hib-tests.log" 2>&1 || { echo 'Tests failed; reproduce against the selected private source ref. Raw output is withheld from public logs.'; exit 1; }
+
+  prepare_release:
+    permissions:
+      contents: write
+    needs: verify
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: gyteng/hib-cli
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          persist-credentials: false
+          ref: ${{ needs.verify.outputs.source_sha }}
+      - name: Prepare draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test -n "$GH_TOKEN" || { echo '缺少发布凭据' >&2; exit 1; }
+          node ci/assert-release-version.mjs "$RELEASE_TAG" > VERSION
+          node ci/release-notes.mjs > release-notes.md
+          if gh release view "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --json isDraft --jq .isDraft > is-draft.txt 2>/dev/null; then
+            test "$(cat is-draft.txt)" = true || { echo '该版本已经正式发布，不覆盖正式版本' >&2; exit 1; }
+          else
+            gh release create "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --target main \
+              --title "hib $RELEASE_TAG" --notes-file release-notes.md --draft
+          fi
+          gh release upload "$RELEASE_TAG" install/install.sh install/install.ps1 VERSION \
+            --repo "$RELEASE_REPOSITORY" --clobber
+
+  build:
+    permissions:
+      contents: write
+    needs: [verify, prepare_release]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            artifact: hib-windows-x64
+            executable: dist/hib.exe
+            archive: hib-windows-x64.zip
+            archive_files: hib.exe
+          - runner: ubuntu-22.04
+            artifact: hib-linux-x64
+            executable: dist/hib
+            archive: hib-linux-x64.tar.gz
+            archive_files: hib libatomic-hib.so.1
+          - runner: ubuntu-22.04-arm
+            artifact: hib-linux-arm64
+            executable: dist/hib
+            archive: hib-linux-arm64.tar.gz
+            archive_files: hib libatomic-hib.so.1
+          - runner: macos-15-intel
+            artifact: hib-macos-x64
+            executable: dist/hib
+            archive: hib-macos-x64.tar.gz
+            archive_files: hib
+          - runner: macos-15
+            artifact: hib-macos-arm64
+            executable: dist/hib
+            archive: hib-macos-arm64.tar.gz
+            archive_files: hib
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: gyteng/hib-cli
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          persist-credentials: false
+          ref: ${{ needs.verify.outputs.source_sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Install dependencies
+        shell: bash
+        run: |
+          npm ci > "$RUNNER_TEMP/hib-install.log" 2>&1 || { echo 'Dependency installation failed; reproduce against the selected private source ref.'; exit 1; }
+      - name: Build private source
+        shell: bash
+        run: |
+          npm run build:sea -- --output ${{ matrix.executable }} > "$RUNNER_TEMP/hib-build.log" 2>&1 || { echo 'SEA build failed; reproduce against the selected private source ref.'; exit 1; }
+      - name: Bundle Linux atomic runtime
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes patchelf
+          libatomic_path="$(gcc -print-file-name=libatomic.so.1)"
+          test -f "$libatomic_path"
+          cp "$libatomic_path" dist/libatomic-hib.so.1
+          patchelf --replace-needed libatomic.so.1 libatomic-hib.so.1 dist/hib
+          patchelf --set-rpath '$ORIGIN' dist/hib
+          patchelf --print-needed dist/hib | grep -Fx 'libatomic-hib.so.1'
+          if patchelf --print-needed dist/hib | grep -Fx 'libatomic.so.1'; then
+            echo '仍存在未替换的 libatomic.so.1 依赖' >&2
+            exit 1
+          fi
+          ldd dist/hib | tee dist/ldd.txt
+          grep -F 'libatomic-hib.so.1 =>' dist/ldd.txt
+          if grep -F 'not found' dist/ldd.txt; then
+            exit 1
+          fi
+          rm dist/ldd.txt
+      - name: Sign macOS binary ad hoc
+        if: runner.os == 'macOS'
+        run: |
+          codesign --sign - ${{ matrix.executable }}
+      - name: Smoke test binary
+        shell: bash
+        run: |
+          ${{ matrix.executable }} --help > "$RUNNER_TEMP/hib-help.log" 2>&1
+          expected="$(node ci/assert-release-version.mjs)"
+          test "$(${{ matrix.executable }} version)" = "$expected"
+          test "$(${{ matrix.executable }} --version)" = "$expected"
+          HIB_TEST_SEA_BINARY="${{ matrix.executable }}" node --test test/update-check.test.mjs test/cli-improvements.test.mjs test/agent-contract.test.mjs > "$RUNNER_TEMP/hib-smoke.log" 2>&1 || { echo 'Binary tests failed; reproduce against the selected private source ref.'; exit 1; }
+      - name: Create Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/hib.exe -DestinationPath ${{ matrix.archive }}
+      - name: Create Unix archive
+        if: runner.os != 'Windows'
+        run: |
+          tar -czf ${{ matrix.archive }} -C dist ${{ matrix.archive_files }}
+      - name: Stage binary in draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ARCHIVE: ${{ matrix.archive }}
+        run: |
+          gh release upload "$RELEASE_TAG" "$RELEASE_ARCHIVE" --repo "$RELEASE_REPOSITORY" --clobber
+
+  publish:
+    permissions:
+      contents: write
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Prepare release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir release
+          gh release download "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --pattern 'hib-*' --dir release
+          cd release
+          for archive in hib-linux-x64.tar.gz hib-linux-arm64.tar.gz hib-macos-x64.tar.gz hib-macos-arm64.tar.gz hib-windows-x64.zip; do
+            test -s "$archive" || { echo "缺少安装包 $archive" >&2; exit 1; }
+          done
+          sha256sum hib-* > SHA256SUMS
+          gh release upload "$RELEASE_TAG" SHA256SUMS --repo "$RELEASE_REPOSITORY" --clobber
+      - name: Publish public release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test -n "$GH_TOKEN" || { echo "缺少发布凭据" >&2; exit 1; }
+          gh release edit "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --draft=false --latest

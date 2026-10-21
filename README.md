@@ -71,3 +71,24 @@ powershell -NoProfile -Command "& ([scriptblock]::Create((irm https://github.com
 ```
 
 默认卸载会删除程序以及安装器写入的 `PATH` 配置，本地登录信息仍保留在 `~/.hib`。如需连同登录信息彻底清理，将 Unix 的 `--uninstall` 改为 `--purge`，或将 Windows PowerShell / CMD 命令中的 `-Uninstall` 改为 `-Purge`。设置过 `HIB_INSTALL_DIR` 时，卸载前需设置相同的环境变量。
+
+## CI 与发布（维护者）
+
+本仓库收到 `v*` tag 推送后，从私有 `gyteng/hib-cli` 仓库检出同名 tag，执行测试及 Windows x64、Linux x64/arm64、macOS x64/arm64 构建并发布。私有源码仓库不运行 Actions。
+
+1. 在本仓库 Actions secrets 配置 `SOURCE_READ_TOKEN`，仅授予私有源码仓库 Contents: read。发布使用本仓库 `GITHUB_TOKEN`。
+2. 先将工作流提交到 main 分支。
+3. 在私有源码仓库创建并推送版本 tag，再在本仓库创建并推送同名 tag。两个仓库的 tag 指向各自的提交；本仓库 tag 必须包含发布工作流。
+
+```powershell
+git -C C:\Users\HM\Code\hib-cli tag v0.1.26
+git -C C:\Users\HM\Code\hib-cli push origin refs/tags/v0.1.26
+git -C C:\Users\HM\Code\hib-cli-releases tag v0.1.26
+git -C C:\Users\HM\Code\hib-cli-releases push origin refs/tags/v0.1.26
+```
+
+上述创建 tag 命令适用于尚不存在的 tag。已有版本构建失败后，可在本仓库 Actions 页面重跑，无需移动 tag。
+
+源码 tag 不存在或与 package.json 版本不匹配时终止。全部五个平台通过后生成 SHA256SUMS 并正式发布；失败可重试草稿，不能覆盖已正式发布的版本。
+
+原始测试和构建日志不公开上传，也不缓存源码；失败时在本机检出对应源码 tag 复现。工作流、执行元数据与正式发布内容公开可见。仅允许可信维护者修改工作流与推送版本 tag。
