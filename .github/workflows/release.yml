@@ -162,7 +162,7 @@ jobs:
           expected="$(node ci/assert-release-version.mjs)"
           test "$(HIB_NO_UPDATE_CHECK=1 ${{ matrix.executable }} version)" = "$expected"
           test "$(HIB_NO_UPDATE_CHECK=1 ${{ matrix.executable }} --version)" = "$expected"
-          HIB_TEST_SEA_BINARY="${{ matrix.executable }}" node --test test/update-check.test.mjs test/cli-improvements.test.mjs test/agent-contract.test.mjs > "$RUNNER_TEMP/hib-smoke.log" 2>&1 || { echo 'Binary tests failed; reproduce against the selected private source ref.'; exit 1; }
+          HIB_TEST_SEA_BINARY="${{ matrix.executable }}" node --test test/update-check.test.mjs test/cli-improvements.test.mjs test/agent-contract.test.mjs test/multi-user.test.mjs > "$RUNNER_TEMP/hib-smoke.log" 2>&1 || { echo 'Binary tests failed; reproduce against the selected private source ref.'; exit 1; }
       - name: Create Windows archive
         if: runner.os == 'Windows'
         shell: pwsh
